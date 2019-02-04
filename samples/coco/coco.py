@@ -27,10 +27,10 @@ Usage: import the module (see Jupyter notebooks for examples), or run from
     python3 coco.py evaluate --dataset=/path/to/coco/ --model=last
 
     # Train a MobileNet224v1 model starting from ImageNet weights
-    python3 coco.py train --dataset=/path/to/coco/ --model=imagenet --backbone=mobilenet224v1
+    python3 coco.py train --dataset=/path/to/coco/ --model=imagenet --backbone=mobilenetv2
 
     # Continue training the last MobileNet224v1 model you trained
-    python3 coco.py train --dataset=/path/to/coco/ --model=last --backbone=mobilenet224v1
+    python3 coco.py train --dataset=/path/to/coco/ --model=last --backbone=mobilenetv2
 
 """
 
@@ -530,16 +530,16 @@ if __name__ == '__main__':
 
         # Training - Stage 2
         # Finetune layers from ResNet stage 4 and up
-        if config.BACKBONE == "mobilenet224v1":
-            stage_2_layers = '11M+'
+        if config.BACKBONE == "mobilenetv2":
+            c4plus_layers = '4M+'
         else:
-            stage_2_layers = '4+'
+            c4plus_layers = '4+'
 
-        print("Fine tune {} stage {} and up".format(config.BACKBONE, stage_2_layers))
+        print("Fine tune {} stage {} and up".format(config.BACKBONE, c4plus_layers))
         model.train(dataset_train, dataset_val,
                     learning_rate=config.LEARNING_RATE,
                     epochs=120,
-                    layers=stage_2_layers,
+                    layers=c4plus_layers,
                     augmentation=augmentation)
 
         # Training - Stage 3

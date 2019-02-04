@@ -54,6 +54,10 @@ class Config(object):
     # to COMPUTE_BACKBONE_SHAPE as well
     BACKBONE = "resnet101"
 
+    # MobilenetV2 Alpha parameter
+    # Configure the alpha paramter to tradeoff latency/memory and accuracy
+    ALPHA = 1.0
+
     # Only useful if you supply a callable to BACKBONE. Should compute
     # the shape of each layer of the FPN Pyramid.
     # See model.compute_backbone_shapes

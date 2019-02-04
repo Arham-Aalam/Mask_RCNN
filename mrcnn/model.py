@@ -83,7 +83,7 @@ def compute_backbone_shapes(config, image_shape):
         return config.COMPUTE_BACKBONE_SHAPE(image_shape)
 
     # Currently supports ResNet only
-    assert config.BACKBONE in ["resnet50", "resnet101", "mobilenet224v1"]
+    assert config.BACKBONE in ["resnet50", "resnet101", "mobilenetv2"]
     return np.array(
         [[int(math.ceil(image_shape[0] / stride)),
             int(math.ceil(image_shape[1] / stride))]
@@ -208,6 +208,11 @@ def resnet_graph(input_image, architecture, stage5=False, train_bn=True):
         C5 = x = identity_block(x, 3, [512, 512, 2048], stage=5, block='c', train_bn=train_bn)
     else:
         C5 = None
+    print('C1=',K.int_shape(C1))
+    print('C2=',K.int_shape(C2))
+    print('C3=',K.int_shape(C3))
+    print('C4=',K.int_shape(C4))
+    print('C5=',K.int_shape(C5))
     return [C1, C2, C3, C4, C5]
 
 
@@ -216,7 +221,506 @@ def resnet_graph(input_image, architecture, stage5=False, train_bn=True):
 ############################################################
 
 # Code adopted from:
+# https://github.com/keras-team/keras-applications/blob/master/keras_applications/mobilenet_v2.py
+
 # https://github.com/fchollet/deep-learning-models/blob/master/mobilenet.py
+
+def correct_pad(inputs, kernel_size):  # backend,  
+    """Returns a tuple for zero-padding for 2D convolution with downsampling.
+    # Arguments
+        input_size: An integer or tuple/list of 2 integers.
+        kernel_size: An integer or tuple/list of 2 integers.
+    # Returns
+        A tuple.
+    """
+    img_dim = 2 if K.image_data_format() == 'channels_first' else 1
+    input_size = K.int_shape(inputs)[img_dim:(img_dim + 2)]
+
+    if isinstance(kernel_size, int):
+        kernel_size = (kernel_size, kernel_size)
+
+    if input_size[0] is None:
+        adjust = (1, 1)
+    else:
+        adjust = (1 - input_size[0] % 2, 1 - input_size[1] % 2)
+
+    correct = (kernel_size[0] // 2, kernel_size[1] // 2)
+
+    return ((correct[0] - adjust[0], correct[0]),
+            (correct[1] - adjust[1], correct[1]))
+
+
+def _make_divisible(v, divisor, min_value=None):
+    if min_value is None:
+        min_value = divisor
+    new_v = max(min_value, int(v + divisor / 2) // divisor * divisor)
+    # Make sure that round down does not go down by more than 10%.
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
+
+
+def MobileNetV2(input_shape=None,
+                alpha=1.0,
+                include_top=True,
+                weights='imagenet',
+                input_tensor=None,
+                pooling=None,
+                classes=1000,
+                **kwargs):
+    """Instantiates the MobileNetV2 architecture.
+    # Arguments
+        input_shape: optional shape tuple, to be specified if you would
+            like to use a model with an input img resolution that is not
+            (224, 224, 3).
+            It should have exactly 3 inputs channels (224, 224, 3).
+            You can also omit this option if you would like
+            to infer input_shape from an input_tensor.
+            If you choose to include both input_tensor and input_shape then
+            input_shape will be used if they match, if the shapes
+            do not match then we will throw an error.
+            E.g. `(160, 160, 3)` would be one valid value.
+        alpha: controls the width of the network. This is known as the
+        width multiplier in the MobileNetV2 paper, but the name is kept for
+        consistency with MobileNetV1 in Keras.
+            - If `alpha` < 1.0, proportionally decreases the number
+                of filters in each layer.
+            - If `alpha` > 1.0, proportionally increases the number
+                of filters in each layer.
+            - If `alpha` = 1, default number of filters from the paper
+                 are used at each layer.
+        include_top: whether to include the fully-connected
+            layer at the top of the network.
+        weights: one of `None` (random initialization),
+              'imagenet' (pre-training on ImageNet),
+              or the path to the weights file to be loaded.
+        input_tensor: optional Keras tensor (i.e. output of
+            `layers.Input()`)
+            to use as image input for the model.
+        pooling: Optional pooling mode for feature extraction
+            when `include_top` is `False`.
+            - `None` means that the output of the model
+                will be the 4D tensor output of the
+                last convolutional block.
+            - `avg` means that global average pooling
+                will be applied to the output of the
+                last convolutional block, and thus
+                the output of the model will be a
+                2D tensor.
+            - `max` means that global max pooling will
+                be applied.
+        classes: optional number of classes to classify images
+            into, only to be specified if `include_top` is True, and
+            if no `weights` argument is specified.
+    # Returns
+        A Keras model instance.
+    # Raises
+        ValueError: in case of invalid argument for `weights`,
+            or invalid input shape or invalid alpha, rows when
+            weights='imagenet'
+    """
+    global backend, layers, models, keras_utils
+    backend, layers, models, keras_utils = get_submodules_from_kwargs(kwargs)
+
+    if not (weights in {'imagenet', None} or os.path.exists(weights)):
+        raise ValueError('The `weights` argument should be either '
+                         '`None` (random initialization), `imagenet` '
+                         '(pre-training on ImageNet), '
+                         'or the path to the weights file to be loaded.')
+
+    if weights == 'imagenet' and include_top and classes != 1000:
+        raise ValueError('If using `weights` as `"imagenet"` with `include_top` '
+                         'as true, `classes` should be 1000')
+
+    # Determine proper input shape and default size.
+    # If both input_shape and input_tensor are used, they should match
+    if input_shape is not None and input_tensor is not None:
+        try:
+            is_input_t_tensor = backend.is_keras_tensor(input_tensor)
+        except ValueError:
+            try:
+                is_input_t_tensor = backend.is_keras_tensor(
+                    keras_utils.get_source_inputs(input_tensor))
+            except ValueError:
+                raise ValueError('input_tensor: ', input_tensor,
+                                 'is not type input_tensor')
+        if is_input_t_tensor:
+            if backend.image_data_format == 'channels_first':
+                if backend.int_shape(input_tensor)[1] != input_shape[1]:
+                    raise ValueError('input_shape: ', input_shape,
+                                     'and input_tensor: ', input_tensor,
+                                     'do not meet the same shape requirements')
+            else:
+                if backend.int_shape(input_tensor)[2] != input_shape[1]:
+                    raise ValueError('input_shape: ', input_shape,
+                                     'and input_tensor: ', input_tensor,
+                                     'do not meet the same shape requirements')
+        else:
+            raise ValueError('input_tensor specified: ', input_tensor,
+                             'is not a keras tensor')
+
+    # If input_shape is None, infer shape from input_tensor
+    if input_shape is None and input_tensor is not None:
+
+        try:
+            backend.is_keras_tensor(input_tensor)
+        except ValueError:
+            raise ValueError('input_tensor: ', input_tensor,
+                             'is type: ', type(input_tensor),
+                             'which is not a valid type')
+
+        if input_shape is None and not backend.is_keras_tensor(input_tensor):
+            default_size = 224
+        elif input_shape is None and backend.is_keras_tensor(input_tensor):
+            if backend.image_data_format() == 'channels_first':
+                rows = backend.int_shape(input_tensor)[2]
+                cols = backend.int_shape(input_tensor)[3]
+            else:
+                rows = backend.int_shape(input_tensor)[1]
+                cols = backend.int_shape(input_tensor)[2]
+
+            if rows == cols and rows in [96, 128, 160, 192, 224]:
+                default_size = rows
+            else:
+                default_size = 224
+
+    # If input_shape is None and no input_tensor
+    elif input_shape is None:
+        default_size = 224
+
+    # If input_shape is not None, assume default size
+    else:
+        if backend.image_data_format() == 'channels_first':
+            rows = input_shape[1]
+            cols = input_shape[2]
+        else:
+            rows = input_shape[0]
+            cols = input_shape[1]
+
+        if rows == cols and rows in [96, 128, 160, 192, 224]:
+            default_size = rows
+        else:
+            default_size = 224
+
+    input_shape = _obtain_input_shape(input_shape,
+                                      default_size=default_size,
+                                      min_size=32,
+                                      data_format=backend.image_data_format(),
+                                      require_flatten=include_top,
+                                      weights=weights)
+
+    if backend.image_data_format() == 'channels_last':
+        row_axis, col_axis = (0, 1)
+    else:
+        row_axis, col_axis = (1, 2)
+    rows = input_shape[row_axis]
+    cols = input_shape[col_axis]
+
+    if weights == 'imagenet':
+        if alpha not in [0.35, 0.50, 0.75, 1.0, 1.3, 1.4]:
+            raise ValueError('If imagenet weights are being loaded, '
+                             'alpha can be one of `0.35`, `0.50`, `0.75`, '
+                             '`1.0`, `1.3` or `1.4` only.')
+
+        if rows != cols or rows not in [96, 128, 160, 192, 224]:
+            if rows is None:
+                rows = 224
+                warnings.warn('MobileNet shape is undefined.'
+                              ' Weights for input shape'
+                              '(224, 224) will be loaded.')
+            else:
+                raise ValueError('If imagenet weights are being loaded, '
+                                 'input must have a static square shape'
+                                 '(one of (96, 96), (128, 128), (160, 160),'
+                                 '(192, 192), or (224, 224)).'
+                                 'Input shape provided = %s' % (input_shape,))
+
+    if backend.image_data_format() != 'channels_last':
+        warnings.warn('The MobileNet family of models is only available '
+                      'for the input data format "channels_last" '
+                      '(width, height, channels). '
+                      'However your settings specify the default '
+                      'data format "channels_first" (channels, width, height).'
+                      ' You should set `image_data_format="channels_last"` '
+                      'in your Keras config located at ~/.keras/keras.json. '
+                      'The model being returned right now will expect inputs '
+                      'to follow the "channels_last" data format.')
+        backend.set_image_data_format('channels_last')
+        old_data_format = 'channels_first'
+    else:
+        old_data_format = None
+
+    if input_tensor is None:
+        img_input = layers.Input(shape=input_shape)
+    else:
+        if not backend.is_keras_tensor(input_tensor):
+            img_input = layers.Input(tensor=input_tensor, shape=input_shape)
+        else:
+            img_input = input_tensor
+
+    first_block_filters = _make_divisible(32 * alpha, 8)
+    x = layers.ZeroPadding2D(padding=correct_pad(backend, img_input, 3),
+                             name='Conv1_pad')(img_input)
+    x = layers.Conv2D(first_block_filters,
+                      kernel_size=3,
+                      strides=(2, 2),
+                      padding='valid',
+                      use_bias=False,
+                      name='Conv1')(x)
+    x = layers.BatchNormalization(
+        epsilon=1e-3, momentum=0.999, name='bn_Conv1')(x)
+    x = layers.ReLU(6., name='Conv1_relu')(x)
+
+    x = _inverted_res_block(x, filters=16, alpha=alpha, stride=1,
+                            expansion=1, block_id=0)
+
+    x = _inverted_res_block(x, filters=24, alpha=alpha, stride=2,
+                            expansion=6, block_id=1)
+    x = _inverted_res_block(x, filters=24, alpha=alpha, stride=1,
+                            expansion=6, block_id=2)
+
+    x = _inverted_res_block(x, filters=32, alpha=alpha, stride=2,
+                            expansion=6, block_id=3)
+    x = _inverted_res_block(x, filters=32, alpha=alpha, stride=1,
+                            expansion=6, block_id=4)
+    x = _inverted_res_block(x, filters=32, alpha=alpha, stride=1,
+                            expansion=6, block_id=5)
+
+    x = _inverted_res_block(x, filters=64, alpha=alpha, stride=2,
+                            expansion=6, block_id=6)
+    x = _inverted_res_block(x, filters=64, alpha=alpha, stride=1,
+                            expansion=6, block_id=7)
+    x = _inverted_res_block(x, filters=64, alpha=alpha, stride=1,
+                            expansion=6, block_id=8)
+    x = _inverted_res_block(x, filters=64, alpha=alpha, stride=1,
+                            expansion=6, block_id=9)
+
+    x = _inverted_res_block(x, filters=96, alpha=alpha, stride=1,
+                            expansion=6, block_id=10)
+    x = _inverted_res_block(x, filters=96, alpha=alpha, stride=1,
+                            expansion=6, block_id=11)
+    x = _inverted_res_block(x, filters=96, alpha=alpha, stride=1,
+                            expansion=6, block_id=12)
+
+    x = _inverted_res_block(x, filters=160, alpha=alpha, stride=2,
+                            expansion=6, block_id=13)
+    x = _inverted_res_block(x, filters=160, alpha=alpha, stride=1,
+                            expansion=6, block_id=14)
+    x = _inverted_res_block(x, filters=160, alpha=alpha, stride=1,
+                            expansion=6, block_id=15)
+
+    x = _inverted_res_block(x, filters=320, alpha=alpha, stride=1,
+                            expansion=6, block_id=16)
+
+    # no alpha applied to last conv as stated in the paper:
+    # if the width multiplier is greater than 1 we
+    # increase the number of output channels
+    if alpha > 1.0:
+        last_block_filters = _make_divisible(1280 * alpha, 8)
+    else:
+        last_block_filters = 1280
+
+    x = layers.Conv2D(last_block_filters,
+                      kernel_size=1,
+                      use_bias=False,
+                      name='Conv_1')(x)
+    x = layers.BatchNormalization(epsilon=1e-3,
+                                  momentum=0.999,
+                                  name='Conv_1_bn')(x)
+    x = layers.ReLU(6., name='out_relu')(x)
+
+    if include_top:
+        x = layers.GlobalAveragePooling2D()(x)
+        x = layers.Dense(classes, activation='softmax',
+                         use_bias=True, name='Logits')(x)
+    else:
+        if pooling == 'avg':
+            x = layers.GlobalAveragePooling2D()(x)
+        elif pooling == 'max':
+            x = layers.GlobalMaxPooling2D()(x)
+
+    # Ensure that the model takes into account
+    # any potential predecessors of `input_tensor`.
+    if input_tensor is not None:
+        inputs = keras_utils.get_source_inputs(input_tensor)
+    else:
+        inputs = img_input
+
+    # Create model.
+    model = models.Model(inputs, x,
+                         name='mobilenetv2_%0.2f_%s' % (alpha, rows))
+
+    # Load weights.
+    if weights == 'imagenet':
+        if backend.image_data_format() == 'channels_first':
+            raise ValueError('Weights for "channels_first" format '
+                             'are not available.')
+
+        if include_top:
+            model_name = ('mobilenet_v2_weights_tf_dim_ordering_tf_kernels_' +
+                          str(alpha) + '_' + str(rows) + '.h5')
+            weigh_path = BASE_WEIGHT_PATH + model_name
+            weights_path = keras_utils.get_file(
+                model_name, weigh_path, cache_subdir='models')
+        else:
+            model_name = ('mobilenet_v2_weights_tf_dim_ordering_tf_kernels_' +
+                          str(alpha) + '_' + str(rows) + '_no_top' + '.h5')
+            weigh_path = BASE_WEIGHT_PATH + model_name
+            weights_path = keras_utils.get_file(
+                model_name, weigh_path, cache_subdir='models')
+        model.load_weights(weights_path)
+    elif weights is not None:
+        model.load_weights(weights)
+
+    if old_data_format:
+        backend.set_image_data_format(old_data_format)
+    return model
+
+
+def _inverted_res_block(inputs, expansion, stride, alpha, filters, block_id, train_bn=True):
+    in_channels = K.int_shape(inputs)[-1]
+    pointwise_conv_filters = int(filters * alpha)
+    pointwise_filters = _make_divisible(pointwise_conv_filters, 8)
+    x = inputs
+    prefix = 'block_{}_'.format(block_id)
+
+    if block_id:
+        # Expand
+        x = KL.Conv2D(expansion * in_channels,
+                          kernel_size=1,
+                          padding='same',
+                          use_bias=False,
+                          activation=None,
+                          name=prefix + 'expand')(x)
+        x = BatchNorm(#layers.BatchNormalization(
+                                      epsilon=1e-3,
+                                      momentum=0.999,
+                                      name=prefix + 'expand_BN')(x, training=train_bn)
+        x = KL.ReLU(6., name=prefix + 'expand_relu')(x)
+    else:
+        prefix = 'expanded_conv_'
+
+    # Depthwise
+    if stride == 2:
+        x = KL.ZeroPadding2D(padding=correct_pad(x, 3), #backend, x, 3),
+                                 name=prefix + 'pad')(x)
+    x = KL.DepthwiseConv2D(kernel_size=3,
+                               strides=stride,
+                               activation=None,
+                               use_bias=False,
+                               padding='same' if stride == 1 else 'valid',
+                               name=prefix + 'depthwise')(x)
+    x = BatchNorm(#layers.BatchNormalization(
+                                  epsilon=1e-3,
+                                  momentum=0.999,
+                                  name=prefix + 'depthwise_BN')(x, training=train_bn)
+
+    x = KL.ReLU(6., name=prefix + 'depthwise_relu')(x)
+
+    # Project
+    x = KL.Conv2D(pointwise_filters,
+                      kernel_size=1,
+                      padding='same',
+                      use_bias=False,
+                      activation=None,
+                      name=prefix + 'project')(x)
+    x = BatchNorm(#layers.BatchNormalization(
+        epsilon=1e-3, momentum=0.999, name=prefix + 'project_BN')(x, training=train_bn)
+
+    if in_channels == pointwise_filters and stride == 1:
+        return KL.Add(name=prefix + 'add')([inputs, x])
+    return x
+
+
+def mobilenet_graph(img_input, architecture, alpha=1.0, train_bn=True):
+    assert architecture in ["mobilenetv2"]
+    first_block_filters = _make_divisible(32 * alpha, 8)
+    x = KL.ZeroPadding2D(padding=correct_pad(img_input, 3), #backend,  
+                             name='Conv1_pad')(img_input)
+    x = KL.Conv2D(first_block_filters,
+                      kernel_size=3,
+                      strides=(2, 2),
+                      padding='valid',
+                      use_bias=False,
+                      name='Conv1')(x)
+    x = BatchNorm(#layers.BatchNormalization(
+        epsilon=1e-3, momentum=0.999, name='bn_Conv1')(x, training=train_bn)
+    x = KL.ReLU(6., name='Conv1_relu')(x)
+
+    x = _inverted_res_block(x, filters=16, alpha=alpha, stride=1,
+                            expansion=1, block_id=0, train_bn=train_bn)
+
+    x = _inverted_res_block(x, filters=24, alpha=alpha, stride=2,
+                            expansion=6, block_id=1, train_bn=train_bn)
+    x = _inverted_res_block(x, filters=24, alpha=alpha, stride=1,
+                            expansion=6, block_id=2, train_bn=train_bn)
+
+    x = _inverted_res_block(x, filters=32, alpha=alpha, stride=2,
+                            expansion=6, block_id=3, train_bn=train_bn)
+    x = _inverted_res_block(x, filters=32, alpha=alpha, stride=1,
+                            expansion=6, block_id=4, train_bn=train_bn)
+    C1 = x = _inverted_res_block(x, filters=32, alpha=alpha, stride=1,
+                            expansion=6, block_id=5, train_bn=train_bn)
+
+    x = _inverted_res_block(x, filters=64, alpha=alpha, stride=2,
+                            expansion=6, block_id=6, train_bn=train_bn)
+    x = _inverted_res_block(x, filters=64, alpha=alpha, stride=1,
+                            expansion=6, block_id=7, train_bn=train_bn)
+    x = _inverted_res_block(x, filters=64, alpha=alpha, stride=1,
+                            expansion=6, block_id=8, train_bn=train_bn)
+    C2 = x = _inverted_res_block(x, filters=64, alpha=alpha, stride=1,
+                            expansion=6, block_id=9, train_bn=train_bn)
+
+    x = _inverted_res_block(x, filters=96, alpha=alpha, stride=1,
+                            expansion=6, block_id=10, train_bn=train_bn)
+    x = _inverted_res_block(x, filters=96, alpha=alpha, stride=1,
+                            expansion=6, block_id=11, train_bn=train_bn)
+    C3 = x = _inverted_res_block(x, filters=96, alpha=alpha, stride=1,
+                            expansion=6, block_id=12, train_bn=train_bn)
+
+    x = _inverted_res_block(x, filters=160, alpha=alpha, stride=2,
+                            expansion=6, block_id=13, train_bn=train_bn)
+    x = _inverted_res_block(x, filters=160, alpha=alpha, stride=1,
+                            expansion=6, block_id=14, train_bn=train_bn)
+    C4 = x = _inverted_res_block(x, filters=160, alpha=alpha, stride=1,
+                            expansion=6, block_id=15, train_bn=train_bn)
+
+    x = _inverted_res_block(x, filters=320, alpha=alpha, stride=1,
+                            expansion=6, block_id=16, train_bn=train_bn)
+
+    # no alpha applied to last conv as stated in the paper:
+    # if the width multiplier is greater than 1 we
+    # increase the number of output channels
+    if alpha > 1.0:
+        last_block_filters = _make_divisible(1280 * alpha, 8)
+    else:
+        last_block_filters = 1280
+
+    x = KL.Conv2D(last_block_filters,
+                      kernel_size=1,
+                      use_bias=False,
+                      name='Conv_1')(x)
+    x = BatchNorm(#layers.BatchNormalization(
+                                  epsilon=1e-3,
+                                  momentum=0.999,
+                                  name='Conv_1_bn')(x, training=train_bn)
+    C5 = x = KL.ReLU(6., name='out_relu')(x)
+
+    #if pooling == 'avg':
+    #    x = layers.GlobalAveragePooling2D()(x)
+    #elif pooling == 'max':
+    #    x = layers.GlobalMaxPooling2D()(x)
+    print('C1=',K.int_shape(C1))
+    print('C2=',K.int_shape(C2))
+    print('C3=',K.int_shape(C3))
+    print('C4=',K.int_shape(C4))
+    print('C5=',K.int_shape(C5))
+    return [C1, C2, C3, C4, C5]
+ 
+
+####
+# V1
+####
 
 def relu6(x):
     return K.relu(x, max_value=6)
@@ -533,8 +1037,8 @@ def _depthwise_conv_block(inputs, pointwise_conv_filters, alpha,
     return KL.Activation(relu6, name='conv_pw_%d_relu' % block_id)(x)
 
 
-def mobilenet_graph(img_input, architecture, alpha=1.0, depth_multiplier=1, train_bn=True):
-    assert architecture in ["mobilenet224v1"]
+"""def mobilenet_graph(img_input, architecture, alpha=1.0, depth_multiplier=1, train_bn=True):
+    #assert architecture in ["mobilenet224v1"]
     # Stage 1
     x = _conv_block(img_input, 32, alpha, strides=(2, 2), train_bn=train_bn)
     C1 = x = _depthwise_conv_block(x, 64, alpha,
@@ -571,7 +1075,13 @@ def mobilenet_graph(img_input, architecture, alpha=1.0, depth_multiplier=1, trai
                               strides=(2, 2), block_id=12, train_bn=train_bn)
     C5 = x = _depthwise_conv_block(x, 1024, alpha,
                                    depth_multiplier, block_id=13, train_bn=train_bn)
+    print('C1=',C1.shape)
+    print('C2=',C2.shape)
+    print('C3=',C3.shape)
+    print('C4=',C4.shape)
+    print('C5=',C5.shape)
     return [C1, C2, C3, C4, C5]
+"""
 
 ############################################################
 #  Proposal Layer
@@ -2264,9 +2774,9 @@ class MaskRCNN():
         if callable(config.BACKBONE):
             _, C2, C3, C4, C5 = config.BACKBONE(input_image, stage5=True,
                                                 train_bn=config.TRAIN_BN)
-        elif config.BACKBONE in ["mobilenet224v1"]:
+        elif config.BACKBONE in ["mobilenetv2"]:
             _, C2, C3, C4, C5 = mobilenet_graph(input_image, config.BACKBONE,
-                                                alpha=1.0, train_bn=config.TRAIN_BN)
+                                                alpha=config.ALPHA, train_bn=config.TRAIN_BN)
         else:
             _, C2, C3, C4, C5 = resnet_graph(input_image, config.BACKBONE,
                                              stage5=True, train_bn=config.TRAIN_BN)
@@ -2274,9 +2784,12 @@ class MaskRCNN():
         # Top-down Layers
         # TODO: add assert to varify feature map sizes match what's in config
         P5 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c5p5')(C5)
-        P4 = KL.Add(name="fpn_p4add")([
-            KL.UpSampling2D(size=(2, 2), name="fpn_p5upsampled")(P5),
-            KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c4p4')(C4)])
+        P4_1 = KL.UpSampling2D(size=(2, 2), name="fpn_p5upsampled")(P5)
+        P4_2 = KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c4p4')(C4)
+        print('P4_1', P4_1.shape)
+        print('P4_2', P4_2.shape)
+        P4 = KL.Add(name="fpn_p4add")([P4_1,P4_2])
+        print('P4', P4.shape)
         P3 = KL.Add(name="fpn_p3add")([
             KL.UpSampling2D(size=(2, 2), name="fpn_p4upsampled")(P4),
             KL.Conv2D(config.TOP_DOWN_PYRAMID_SIZE, (1, 1), name='fpn_c3p3')(C3)])
@@ -2353,6 +2866,7 @@ class MaskRCNN():
             else:
                 target_rois = rpn_rois
 
+            print('ok')
             # Generate detection targets
             # Subsamples proposals and generates target outputs for training
             # Note that proposal class IDs, gt_boxes, and gt_masks are zero
@@ -2361,6 +2875,7 @@ class MaskRCNN():
                 DetectionTargetLayer(config, name="proposal_targets")([
                     target_rois, input_gt_class_ids, gt_boxes, input_gt_masks])
 
+            print('ok2')
             # Network Heads
             # TODO: verify that this handles zero padded ROIs
             mrcnn_class_logits, mrcnn_class, mrcnn_bbox =\
@@ -2369,12 +2884,14 @@ class MaskRCNN():
                                      train_bn=config.TRAIN_BN,
                                      fc_layers_size=config.FPN_CLASSIF_FC_LAYERS_SIZE)
 
+            print('ok3')
             mrcnn_mask = build_fpn_mask_graph(rois, mrcnn_feature_maps,
                                               input_image_meta,
                                               config.MASK_POOL_SIZE,
                                               config.NUM_CLASSES,
                                               train_bn=config.TRAIN_BN)
 
+            print('wat')
             # TODO: clean up (use tf.identify if necessary)
             output_rois = KL.Lambda(lambda x: x * 1, name="output_rois")(rois)
 
@@ -2513,13 +3030,16 @@ class MaskRCNN():
         Returns path to weights file.
         """
         from keras.utils.data_utils import get_file
-        if self.config.BACKBONE == "mobilenet224v1":
+        if self.config.BACKBONE == "mobilenetv2": #"mobilenet224v1":
             TF_WEIGHTS_PATH_NO_TOP = 'https://github.com/fchollet/deep-learning-models/'\
-                                     'releases/download/v0.6/mobilenet_1_0_224_tf_no_top.h5'
-            weights_path = get_file('mobilenet_1_0_224_tf_no_top.h5',
+                                        'releases/download/v0.6/mobilenet_2_5_224_tf_no_top.h5'
+				#'https://github.com/fchollet/deep-learning-models/'\
+                                #'releases/download/v0.6/mobilenet_1_0_224_tf_no_top.h5'
+            weights_path = get_file('mobilenet_2_5_224_tf_no_top.h5',
+			   #get_file('mobilenet_1_0_224_tf_no_top.h5',
                                 TF_WEIGHTS_PATH_NO_TOP,
                                 cache_subdir='models',
-                                md5_hash='725ccbd03d61d7ced5b5c4cd17e7d527')
+                                md5_hash='f313cee49f5d33dfb06f2b255c4adb64') #'725ccbd03d61d7ced5b5c4cd17e7d527')
         else:
             TF_WEIGHTS_PATH_NO_TOP = 'https://github.com/fchollet/deep-learning-models/'\
                                  'releases/download/v0.2/'\
@@ -2550,7 +3070,7 @@ class MaskRCNN():
             if layer.output in self.keras_model.losses:
                 continue
             loss = (
-                tf.reduce_mean(layer.output, keep_dims=True)
+                tf.reduce_mean(layer.output, keepdims=True)
                 * self.config.LOSS_WEIGHTS.get(name, 1.))
             self.keras_model.add_loss(loss)
 
@@ -2574,7 +3094,7 @@ class MaskRCNN():
             layer = self.keras_model.get_layer(name)
             self.keras_model.metrics_names.append(name)
             loss = (
-                tf.reduce_mean(layer.output, keep_dims=True)
+                tf.reduce_mean(layer.output, keepdims=True)
                 * self.config.LOSS_WEIGHTS.get(name, 1.))
             self.keras_model.metrics_tensors.append(loss)
 
@@ -2698,12 +3218,13 @@ class MaskRCNN():
             "4+": r"(res4.*)|(bn4.*)|(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
             "5+": r"(res5.*)|(bn5.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
             # From a specific Mobilenet stage and up
-            "5M+": r"(conv.*5.*)|(conv.*6.*)|(conv.*7.*)|(conv.*8.*)|(conv.*9.*)|(conv.*10.*)|(conv.*11.*)|(conv.*12.*)|(conv.*13.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
-            "11M+": r"(conv.*11.*)|(conv.*12.*)|(conv.*13.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
-            "13M+": r"(conv.*13.*)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+            "3M+": r"(block.*10.*)|(block.*11.*)|(block.*12.*)|(block.*13.*)|(block.*14.*)|(block.*15.*)|(block.*16.*)|(Conv_1.*)|(out_relu)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+            "4M+": r"(block.*13.*)|(block.*14.*)|(block.*15.*)|(block.*16.*)|(Conv_1.*)|(out_relu)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
+            "5M+": r"(block.*16.*)|(Conv_1.*)|(out_relu)|(mrcnn\_.*)|(rpn\_.*)|(fpn\_.*)",
 	    # All layers
             "all": ".*",
         }
+        
         if layers in layer_regex.keys():
             layers = layer_regex[layers]
 
@@ -2745,6 +3266,7 @@ class MaskRCNN():
         else:
             workers = multiprocessing.cpu_count()
 
+        print(self.keras_model.summary())
         self.keras_model.fit_generator(
             train_generator,
             initial_epoch=self.epoch,
@@ -3179,7 +3701,7 @@ def parse_image_meta_graph(meta):
     }
 
 
-def resnet_mold_image(images, config):
+def mold_image(images, config):
     """Expects an RGB image (or array of images) and subtracts
     the mean pixel and converts it to float. Expects image
     colors in RGB order.
@@ -3187,45 +3709,9 @@ def resnet_mold_image(images, config):
     return images.astype(np.float32) - config.MEAN_PIXEL
 
 
-def resnet_unmold_image(normalized_images, config):
+def unmold_image(normalized_images, config):
     """Takes a image normalized with resnet_mold() and returns the original."""
     return (normalized_images + config.MEAN_PIXEL).astype(np.uint8)
-
-
-def mobilenet_mold_image(images, config):
-    """Expects an RGB image (or array of images) and normalizes by
-    dividing by the median pixel value and subtracting 1.
-    """
-    return images.astype(np.float32)/127.5 - 1.0
-
-
-def mobilenet_unmold_image(normalized_images, config):
-    """Takes an image normalized with mobilenet_mold() and returns the original."""
-    return ((normalized_images + 1)*127.5).astype(np.uint8)
-
-
-def mold_image(images, config):
-    mold_image_dict = {
-        "resnet50": resnet_mold_image,
-        "resnet101": resnet_mold_image,
-        "mobilenet224v1": mobilenet_mold_image
-    }
-
-    if config.BACKBONE not in mold_image_dict:
-        return resnet_mold_image(images, config)
-    return mold_image_dict[config.BACKBONE](images, config)
-
-
-def unmold_image(images, config):
-    unmold_image_dict = {
-        "resnet50": resnet_unmold_image,
-        "resnet101": resnet_unmold_image,
-        "mobilenet224v1": mobilenet_unmold_image
-    }
-
-    if config.BACKBONE not in unmold_image_dict:
-        return resnet_unmold_image(images, config)
-    return unmold_image_dict[config.BACKBONE](images, config)
 
 
 ############################################################
