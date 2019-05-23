@@ -59,20 +59,20 @@ class BalloonConfig(Config):
     Derives from the base Config class and overrides some values.
     """
     # Give the configuration a recognizable name
-    NAME = "balloon"
+    NAME = "sp"
 
     # We use a GPU with 12GB memory, which can fit two images.
     # Adjust down if you use a smaller GPU.
     IMAGES_PER_GPU = 2
 
     # Number of classes (including background)
-    NUM_CLASSES = 1 + 1  # Background + balloon
+    NUM_CLASSES = 1 + 7  # Background + balloon
 
     # Number of training steps per epoch
     STEPS_PER_EPOCH = 100
 
     # Skip detections with < 90% confidence
-    DETECTION_MIN_CONFIDENCE = 0.9
+    DETECTION_MIN_CONFIDENCE = 0.8
 
 
 ############################################################
@@ -87,7 +87,15 @@ class BalloonDataset(utils.Dataset):
         subset: Subset to load: train or val
         """
         # Add classes. We have only one class to add.
-        self.add_class("balloon", 1, "balloon")
+        #self.add_class("balloon", 1, "balloon")
+
+        self.add_class("sp", 1, "s")
+        self.add_class("sp", 2, "c1")
+        self.add_class("sp", 3, "c2")
+        self.add_class("sp", 4, "c3")
+        self.add_class("sp", 5, "c4")
+        self.add_class("sp", 6, "c5")
+        self.add_class("sp", 7, "un")
 
         # Train or validation dataset?
         assert subset in ["train", "val"]
@@ -115,6 +123,7 @@ class BalloonDataset(utils.Dataset):
         # The VIA tool saves images in the JSON even if they don't have any
         # annotations. Skip unannotated images.
         annotations = [a for a in annotations if a['regions']]
+        classes_name = ['s', 'c1', 'c2', 'c3', 'c4', 'c5', 'un']
 
         # Add images
         for a in annotations:
@@ -127,19 +136,19 @@ class BalloonDataset(utils.Dataset):
             else:
                 polygons = [r['shape_attributes'] for r in a['regions']] 
 
+            num_ids = [int(classes_name.index(n['object_name'])) + 1 for n in objects]
             # load_mask() needs the image size to convert polygons to masks.
             # Unfortunately, VIA doesn't include it in JSON, so we must read
             # the image. This is only managable since the dataset is tiny.
             image_path = os.path.join(dataset_dir, a['filename'])
             image = skimage.io.imread(image_path)
             height, width = image.shape[:2]
-
             self.add_image(
-                "balloon",
+                "sp",
                 image_id=a['filename'],  # use file name as a unique image id
                 path=image_path,
                 width=width, height=height,
-                polygons=polygons)
+                polygons=polygons, num_ids=num_ids)
 
     def load_mask(self, image_id):
         """Generate instance masks for an image.
@@ -150,7 +159,7 @@ class BalloonDataset(utils.Dataset):
         """
         # If not a balloon dataset image, delegate to parent class.
         image_info = self.image_info[image_id]
-        if image_info["source"] != "balloon":
+        if image_info["source"] != "sp":
             return super(self.__class__, self).load_mask(image_id)
 
         # Convert polygons to a bitmap mask of shape
@@ -170,7 +179,7 @@ class BalloonDataset(utils.Dataset):
     def image_reference(self, image_id):
         """Return the path of the image."""
         info = self.image_info[image_id]
-        if info["source"] == "balloon":
+        if info["source"] == "sp":
             return info["path"]
         else:
             super(self.__class__, self).image_reference(image_id)
@@ -197,6 +206,12 @@ def train(model):
                 learning_rate=config.LEARNING_RATE,
                 epochs=30,
                 layers='heads')
+    print("Training All network")
+    model.train(dataset_train, dataset_val,
+                learning_rate=config.LEARNING_RATE,
+                epochs=20,
+                #augmentation=augmentation,
+                layers='all')
 
 
 def color_splash(image, mask):
