@@ -173,8 +173,11 @@ class BalloonDataset(utils.Dataset):
         for i, p in enumerate(info["polygons"]):
             # Get indexes of pixels inside the polygon and set them to 1
             rr, cc = skimage.draw.polygon(p['all_points_y'], p['all_points_x'])
-            if i == 1280:
-                mask[rr, cc, i-1] = 1
+            if rr == 720:
+                mask[rr-1, cc, i] = 1
+                continue
+            if cc == 1280:
+                mask[rr, cc-1, i] = 1
                 continue
             mask[rr, cc, i] = 1
 
