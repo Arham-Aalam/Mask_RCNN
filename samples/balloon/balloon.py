@@ -33,6 +33,7 @@ import json
 import datetime
 import numpy as np
 import skimage.draw
+from imgaug import augmenters as iaa
 
 # Root directory of the project
 ROOT_DIR = os.path.abspath("../../")
@@ -201,7 +202,19 @@ def train(model):
     dataset_val = BalloonDataset()
     dataset_val.load_balloon(args.dataset, "val")
     dataset_val.prepare()
-
+    
+    augmentation = None
+    print('################################################################')
+    print('############# Using Data Augmentation ##########################')
+    print('################################################################')
+    augmentation = iaa.OneOf([
+        iaa.Fliplr(0.5),
+        iaa.Flipud(0.5),
+        iaa.OneOf([iaa.Affine(rotate=90),
+                iaa.Affine(rotate=180),
+                iaa.Affine(rotate=270)]),
+        iaa.Multiply((0.8, 1.5))
+    ])
     # *** This training schedule is an example. Update to your needs ***
     # Since we're using a very small dataset, and starting from
     # COCO trained weights, we don't need to train too long. Also,
@@ -209,7 +222,8 @@ def train(model):
     print("Training network heads")
     model.train(dataset_train, dataset_val,
                 learning_rate=config.LEARNING_RATE,
-                epochs=40,
+                epochs=50,
+                augmentation=augmentation,
                 layers='heads')
     '''
     print("Training All network")
