@@ -67,7 +67,7 @@ class BalloonConfig(Config):
     IMAGES_PER_GPU = 1
 
     # Number of classes (including background)
-    NUM_CLASSES = 1 + 7  # Background + balloon
+    NUM_CLASSES = 1 + 8  # Background + balloon
 
     # Number of training steps per epoch
     STEPS_PER_EPOCH = 50
@@ -96,7 +96,8 @@ class BalloonDataset(utils.Dataset):
         self.add_class("sp", 4, "c3")
         self.add_class("sp", 5, "c4")
         self.add_class("sp", 6, "c5")
-        self.add_class("sp", 7, "un")
+        self.add_class("sp", 7, "sh")
+        self.add_class("sp", 8, "un")
 
         # Train or validation dataset?
         assert subset in ["train", "val"]
